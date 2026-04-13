@@ -1,4 +1,4 @@
----
+x---
 title: "Vercel AI SDK Auto-Tracing — Final"
 type: reference
 status: shipped
@@ -11,15 +11,11 @@ supersedes:
   - docs/plans/auto_tracing_vercel_v2.md
   - docs/plans/vercel-expanded-scope.md
   - docs/plans/vercel-llm-config-audit.md
-sources:
-  - docs/vercel-issues.md (issue tracker, kept live)
 ---
 
 # Vercel AI SDK Auto-Tracing — Final
 
 This is the single source of truth for the Vercel AI SDK instrumentation in `@browserstack/ai-sdk`. It consolidates the implementation plan, the architectural decisions, the upstream issues we've hit, and every fix shipped through PR #961.
-
-For the live issue tracker, see `docs/vercel-issues.md`.
 
 ---
 
@@ -332,7 +328,9 @@ Span name internally is `vercel-ai.agent.generate`. The trace UI displays it by 
 
 Verified end-to-end via REST API: all sibling spans correctly share the same `parentObservationId`. The visual indentation difference is a renderer quirk in the trace viewer, not a real parent-child relationship issue. File against the trace-viewer team if it causes confusion.
 
-### Other live issues from `docs/vercel-issues.md`
+### Resolved issues found during testing
+
+Historical record of issues caught and resolved during development. Issue #9 (above) is the only one still active (upstream).
 
 | # | Issue | Status |
 |---|---|---|
@@ -345,8 +343,6 @@ Verified end-to-end via REST API: all sibling spans correctly share the same `pa
 | 7 | generateImage missing cost | **Improved** — captures full `providerMetadata` |
 | 8 | OpenAI `no_cache_tokens` extra fields | Correct provider value |
 | 9 | Tool calls fail | **Upstream bug** (above) |
-
-See `docs/vercel-issues.md` for the full live tracker.
 
 ---
 
@@ -373,7 +369,6 @@ See `docs/vercel-issues.md` for the full live tracker.
 | `tests/featureTest/auto-tracing/wrap-vercel-ai.test.ts` | 60+ unit tests |
 | `tests/llm-providers/auto-tracing-vercel-ai-agent.cjs` | Live integration test (runs against real OpenAI + local backend) |
 | `docs/plans/vercel-ai-final.md` | This document |
-| `docs/vercel-issues.md` | Live issue tracker |
 
 ---
 
@@ -393,7 +388,7 @@ The demo app exposes 19 routes for the `vercel_ai` provider. Recommended demo su
 | `POST /function-call-required` | `toolChoice: 'required'` |
 | `POST /system-instruction` | System prompt |
 | `POST /structured-output` | `generateObject` |
-| `POST /agent-run` | `ToolLoopAgent.generate` — alternating doGenerate/tool/doGenerate |
+| `POST /agent-run` | `ToolLoopcan iAgent.generate` — alternating doGenerate/tool/doGenerate |
 | `POST /agent-stream` | `ToolLoopAgent.stream` |
 | `POST /multi-agent` | Coordinator + 2 sub-agents (nested via tool bodies) |
 | `POST /nested-agents` | Main agent → tool → sub-agent → tool (deepest nesting) |
@@ -430,5 +425,4 @@ All changes live in `src/instrumentations/vercel-ai/wrap-vercel-ai.ts`. Net diff
 - v6 migration guide: https://ai-sdk.dev/docs/migration-guides/migration-guide-6-0
 - OTel GenAI semantic conventions: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
 - Braintrust `wrapAISDK` source (reference for `doGenerate` span shape): `github.com/braintrustdata/braintrust-sdk/js/src/wrappers/ai-sdk/ai-sdk.ts`
-- Live issue tracker: `docs/vercel-issues.md`
 - Demo app: `demo-application/nodejs/providers/vercel_ai.js`
