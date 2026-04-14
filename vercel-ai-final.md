@@ -1,4 +1,4 @@
-x---
+---
 title: "Vercel AI SDK Auto-Tracing — Final"
 type: reference
 status: shipped
@@ -51,7 +51,7 @@ Calling `Observe.wrapVercelAI(ai)` returns a Proxy over the `ai` module. Every w
 | `ai@4.x` | AI SDK 4 | Best-effort (v4 compatibility layer) |
 | `ai@5.x` | AI SDK 5 | Full support |
 | `ai@6.x` | AI SDK 6 | Full support (current default) |
-| `ai@7.x-beta` | AI SDK 7 | Out of scope (separate plan) |
+| `ai@7.x-beta` | AI SDK 7 | Out of scope (separate plan — will use `registerTelemetryIntegration`) |
 
 `v4 + v5 + v6` covers ~95% of `ai`-package downloads.
 
@@ -106,7 +106,7 @@ vercel-ai.agent.generate
 vercel-ai.agent.generate (coordinator)
 ├── vercel-ai.doGenerate              ← coordinator step 1
 ├── vercel-ai.tool.askResearcher
-│   └── vercel-ai.agent.generate      ← researcher SUB-AGENT (UI shows as "Object.execute")
+│   └── vercel-ai.agent.generate      ← researcher SUB-AGENT
 │       └── vercel-ai.doGenerate      ← sub-agent's LLM call
 ├── vercel-ai.doGenerate              ← coordinator step 2
 ├── vercel-ai.tool.askWriter
@@ -192,6 +192,8 @@ Three approaches were considered:
 - Provider-agnostic — no hardcoded provider list
 - Works for both CJS and ESM out of the box
 - Trade-off: user adds one line `Observe.wrapVercelAI(ai)` instead of zero. Same pattern as Braintrust's `wrapAISDK(ai)`.
+
+**Lesson learned:** The original plan proposed zero-config auto-tracing by patching ESM standalone function exports. ESM bindings are immutable live references — they cannot be replaced from outside the module. This was the single biggest architectural miss in the project. See `references/sdk-instrumentation-lessons.md` §1a.
 
 ### D2. Per-LLM-call `doGenerate` / `doStream` spans (added later)
 
@@ -309,6 +311,12 @@ tool({
 
 **Impact on us:** None — we pass tools through unchanged. The mismatch is in the AI SDK core.
 
+### Limitation: Vercel AI SDK's built-in `experimental_telemetry` can duplicate spans
+
+The Vercel AI SDK has built-in OTel telemetry via `experimental_telemetry: { isEnabled: true }` on `generateText`/`streamText`/etc. If a user enables this AND uses `Observe.wrapVercelAI(ai)`, both paths emit spans for the same call → duplicates. No dedup logic exists currently.
+
+**Mitigation:** Document the conflict in usage docs. Users should use one or the other, not both. A future enhancement could detect `experimental_telemetry.isEnabled` in the options and log a warning or skip wrapping for that call.
+
 ### Limitation: `generateText` doesn't loop in v6
 
 Plain `generateText({ tools, maxSteps: 10 })` makes one LLM call, executes whatever tools it asked for, then stops. It does NOT loop back to synthesize a final answer in v6. Use `ToolLoopAgent` for that.
@@ -326,7 +334,15 @@ Span name internally is `vercel-ai.agent.generate`. The trace UI displays it by 
 
 ### Limitation: First child of a generation-type span appears one indent deeper in the UI
 
-Verified end-to-end via REST API: all sibling spans correctly share the same `parentObservationId`. The visual indentation difference is a renderer quirk in the trace viewer, not a real parent-child relationship issue. File against the trace-viewer team if it causes confusion.
+Verified end-to-end via REST API: all sibling spans correctly share the same `parentObservationId`. The visual indentation difference is a renderer quirk in the trace viewer, not a real parent-child relationship issue.
+
+### Limitation: Tool arguments not scanned for secrets
+
+Tool `execute` arguments are captured verbatim via `JSON.stringify(toolArgs)`. If a user passes API keys, tokens, or auth headers as tool arguments, they will appear in the span. A lightweight redaction pass (scanning for `api_key`, `token`, `secret`, `password`, `bearer` patterns) would improve safety. Tracked for a future enhancement.
+
+### Limitation: `doStream` TransformStream span can leak on abandoned streams
+
+The `doStream` wrapper relies on `flush()` as a safety net to end the span. If the consumer abandons the stream without consuming or erroring, `flush()` may never fire. The higher-level `onError`/`onAbort` callbacks mitigate at the top-level span, but the inner `doStream` span has no timeout protection. A configurable timeout (e.g., 5 minutes) would resolve this.
 
 ### Resolved issues found during testing
 
@@ -356,10 +372,32 @@ Historical record of issues caught and resolved during development. Issue #9 (ab
 | Per-step LLM spans (via `onStepFinish`) | Already covered by per-`doGenerate` spans. Adding step-level spans would duplicate. |
 | `headers` / `abortSignal` | Request infrastructure, not observability-relevant. |
 | Embedding / image / rerank `doGenerate` spans | Single-call operations — top-level span already captures everything. |
+| `providerOptions` individual fields | Captured as a single JSON blob (truncated at 8KB), not exploded into individual attributes. Provider-specific, deeply nested, and change frequently. |
 
 ---
 
-## 8. Files
+## 8. Competitive position
+
+| Capability | Us | Braintrust | Langfuse | Arize |
+|---|---|---|---|---|
+| Setup | `Observe.wrapVercelAI(ai)` | `wrapAISDK(ai)` | `experimental_telemetry` per call | Same as Langfuse |
+| ESM + CJS | Yes | Yes | Yes | Yes |
+| `embed` / `embedMany` | Yes | Yes | No | No |
+| `generateImage` | Yes | **No** (verified 2026-04-08, `ai-sdk.ts`) | No | No |
+| `rerank` | Yes | **No** (verified 2026-04-08) | No | No |
+| Agent tracing | Yes | Yes | No | No |
+| Per-tool child spans | Yes | Yes | No | No |
+| Per-LLM-call (`doGenerate`) spans | Yes | Yes | No | No |
+| `totalUsage` (multi-step) | Yes | Yes | No | No |
+| `steps_count` | Yes | Yes | No | No |
+| TTFT (time to first token) | Yes | Yes | No | No |
+| OTel-native spans | **Yes** | No (proprietary) | Yes | Yes |
+
+**Verified claims:** All "No" entries for competitors were verified against source or docs on 2026-04-08. Braintrust `embed`/`embedMany` support was initially claimed as absent — this was **wrong** (they have `wrapEmbed`/`wrapEmbedMany`). Corrected above. See `references/sdk-instrumentation-lessons.md` §11a for the full competitor-claim lesson.
+
+---
+
+## 9. Files
 
 | File | Role |
 |---|---|
@@ -372,7 +410,7 @@ Historical record of issues caught and resolved during development. Issue #9 (ab
 
 ---
 
-## 9. Demo routes (in `demo-application/nodejs`)
+## 10. Demo routes (in `demo-application/nodejs`)
 
 The demo app exposes 19 routes for the `vercel_ai` provider. Recommended demo subset (covers every unique span shape):
 
@@ -388,7 +426,7 @@ The demo app exposes 19 routes for the `vercel_ai` provider. Recommended demo su
 | `POST /function-call-required` | `toolChoice: 'required'` |
 | `POST /system-instruction` | System prompt |
 | `POST /structured-output` | `generateObject` |
-| `POST /agent-run` | `ToolLoopcan iAgent.generate` — alternating doGenerate/tool/doGenerate |
+| `POST /agent-run` | `ToolLoopAgent.generate` — alternating doGenerate/tool/doGenerate |
 | `POST /agent-stream` | `ToolLoopAgent.stream` |
 | `POST /multi-agent` | Coordinator + 2 sub-agents (nested via tool bodies) |
 | `POST /nested-agents` | Main agent → tool → sub-agent → tool (deepest nesting) |
@@ -396,7 +434,7 @@ The demo app exposes 19 routes for the `vercel_ai` provider. Recommended demo su
 
 ---
 
-## 10. Recent fixes timeline (PR #961)
+## 11. Recent fixes timeline (PR #961)
 
 In rough order of when they shipped during the PR:
 
@@ -417,7 +455,28 @@ All changes live in `src/instrumentations/vercel-ai/wrap-vercel-ai.ts`. Net diff
 
 ---
 
-## 11. References
+## 12. Lessons contributed to SDK review skill
+
+This instrumentation's post-mortem produced lessons that are now encoded in the team's `/sdk-review-instrumentation` skill rubric. Key contributions:
+
+| Lesson | Rubric rule | Category |
+|---|---|---|
+| ESM standalone function exports cannot be patched | MS-1 (Architectural Blocker) | module-system |
+| Competitor claims without source links are wrong by default | CC-1, CC-3 (Blocker) | competitor-claims |
+| Version matrix with wrong npm→SDK mapping | VM-1 (Warning) | version-matrix |
+| `!== undefined` drops `null` token values | RS-2 (Blocker) | runtime-shape |
+| `agent.stream()` returns Promise, not sync result | RS-1, AF-8 (Blocker) | runtime-shape |
+| Zod schema internals leak via `JSON.stringify` | CS-3 (Blocker) | content-safety |
+| `onFinish` callback chaining must isolate user errors | RS-5 (Warning) | runtime-shape |
+| `finishReason` may be object, not string | RS-6 (Warning) | runtime-shape |
+| `experimental_telemetry` dedup with our wrapping | AF-7 (Warning) | agent-framework |
+| Tool object mutation causes nested duplicates | AF-5 (Blocker) | agent-framework |
+
+See `.claude/skills/sdk:review-instrumentation/references/sdk-instrumentation-lessons.md` for the full catalogue.
+
+---
+
+## 13. References
 
 - Upstream bug: [vercel/ai#12020](https://github.com/vercel/ai/issues/12020)
 - Vercel AI SDK docs: https://ai-sdk.dev
@@ -425,4 +484,6 @@ All changes live in `src/instrumentations/vercel-ai/wrap-vercel-ai.ts`. Net diff
 - v6 migration guide: https://ai-sdk.dev/docs/migration-guides/migration-guide-6-0
 - OTel GenAI semantic conventions: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
 - Braintrust `wrapAISDK` source (reference for `doGenerate` span shape): `github.com/braintrustdata/braintrust-sdk/js/src/wrappers/ai-sdk/ai-sdk.ts`
+- SDK instrumentation review skill: `.claude/skills/sdk:review-instrumentation/`
+- Lessons catalogue: `.claude/skills/sdk:review-instrumentation/references/sdk-instrumentation-lessons.md`
 - Demo app: `demo-application/nodejs/providers/vercel_ai.js`
