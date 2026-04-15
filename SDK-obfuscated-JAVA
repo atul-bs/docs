@@ -1,0 +1,542 @@
+# Java SDK Obfuscation — PRD & Implementation Notes
+
+**Date:** 2026-04-15
+**Scope:** PRD for Java SDK obfuscation, what we built to satisfy it, and how the ProGuard keep rules work in practice.
+
+---
+
+# Part 1 — Product Requirements Document
+
+## Problem Statement
+
+The Java SDK (`browserstack-ai-sdk-java`) ships as a JAR that any user can decompile with free tools (JD-GUI, CFR, Fernflower, IntelliJ's built-in decompiler). Without obfuscation:
+
+- **Competitive risk (2026 reality)**: A competitor can decompile the JAR, feed the output to an LLM (Claude/GPT), and reconstruct a working clone in hours. Readable source = zero friction to copy.
+- **Brand exposure**: The SDK is built on Langfuse internals. The `@@@langfuseMedia` string in `Media.java` reveals the upstream dependency.
+- **Endpoint disclosure**: Hardcoded URLs (`https://evals-api.browserstack.com`, `https://evals-ingestion.browserstack.com`, `/api/public/otel/v1/traces-msgpackr`) and env var names (`AISDK_PUBLIC_KEY`) are visible as string literals.
+- **Parity gap**: Node.js SDK (Rollup + javascript-obfuscator) and Python SDK (OPy) both obfuscate identifiers AND encrypt strings. Java was the only SDK without this protection.
+
+## Goals
+
+| # | Requirement | Success criterion |
+|---|---|---|
+| R1 | **Identifier obfuscation** — rename internal classes/methods/fields | Decompiled internal classes show single-letter names (`a`, `b`, `c`) |
+| R2 | **String encryption** — encrypt all string constants in non-keep classes | No URLs, env var names, auth headers, or brand strings visible in `strings <jar>` output |
+| R3 | **Preserve public API** — users' existing code must work unchanged | Demo app (`rag-context-propagation`) compiles and runs without modification |
+| R4 | **Preserve ByteBuddy auto-tracing** — bytecode instrumentation must still inline correctly | OpenAI/Anthropic/Spring AI auto-tracing works end-to-end |
+| R5 | **Preserve Jackson serialization** — API models must deserialize correctly | `sdk.datasets().list()` returns populated objects, not empty fields |
+| R6 | **Zero config for new instrumentations** — adding Bedrock/Gemini/etc. should need no obfuscation changes | Package-level wildcards cover new classes automatically |
+| R7 | **Zero source code changes** — obfuscation is a build-time transform | No `@Obfuscate` annotations or other source decorations |
+| R8 | **Debug mapping file** — stack traces must be decodable for support | `mapping.txt` produced alongside JAR, shipped to S3 separately |
+| R9 | **Parity with Node.js / Python SDKs** | Same level of protection: identifiers + strings + brand hiding |
+| R10 | **Validation in CI** — catch obfuscation regressions before publish | Build fails if sensitive strings leak or public API breaks |
+
+## Non-goals
+
+- Control flow flattening (unnecessary complexity; breaks ByteBuddy)
+- Whole-class encryption (requires custom ClassLoader at runtime)
+- Protection against runtime debugging (any Java app can be debugged with agents; not the threat model)
+- Unbreakable obfuscation (no such thing for Java bytecode; goal is raising attacker cost)
+
+## Threat model
+
+- **Primary attacker**: Competitor or customer who wants to understand how the SDK works, clone it, or extract hardcoded secrets.
+- **Attacker capability**: Standard Java decompiler + LLM assistance. No runtime debugging of the SDK in production.
+- **What we protect**: Architecture (call graph), integration surface (URLs, endpoints), brand association (Langfuse), internal implementation (batching, serialization, auth).
+- **What we don't protect**: User's own code using the SDK (out of scope), runtime behavior visible via network inspection (visible regardless of obfuscation).
+
+### Calibrated expectations — deterrence-grade, not security-grade
+
+This obfuscation is **deterrence-grade**, not **security-grade** or **DRM-grade**. Be honest about what each layer buys you:
+
+| Layer | What it defeats | What it does NOT defeat |
+|---|---|---|
+| **Identifier renaming** (ProGuard) | LLM reconstruction from decompiled source — variable names like `BatchSender.flush()` give away architecture; `a.b()` does not | A patient human reader who maps the call graph manually |
+| **String encryption** (XOR + golden ratio mixing) | `strings` command + grep, casual decompiler inspection | Anyone who extracts `D.class` and writes a 10-line script to call `D.s()` on each encrypted byte array. The decryptor is right there in the JAR. |
+| **Stripped debug info** | Stack traces matching exact source lines | Bytecode-level analysis tools |
+
+The **real protection** is the *combination*: identifier renaming + stripped debug info make LLM-assisted reconstruction expensive (estimated 4-8 hours of skilled effort per significant component). String encryption raises the bar for `strings`-style scans and makes the decompiled output unscannable for credentials/URLs.
+
+**Goal**: raise the cost of cloning the SDK to where it's cheaper to write your own from scratch. Not to prevent reverse engineering.
+
+**For genuine secret protection** (API keys, license tokens, etc.): never embed them in the JAR. Always read at runtime from environment or secure storage. The SDK already does this — `AISDK_PUBLIC_KEY` is read from env, never hardcoded.
+
+## Success definition
+
+The obfuscation pipeline is successful when:
+
+1. Running `strings` on the distributed JAR finds zero occurrences of: `langfuseMedia`, `Authorization`, `AISDK_PUBLIC_KEY`, `AISDK_SECRET_KEY`, `TESTOPS_PUBLIC_KEY`, `TESTOPS_SECRET_KEY`, `https://evals-api.browserstack.com`, `https://evals-ingestion.browserstack.com`, `/api/public/otel/v1/traces-msgpackr`, `application/x-msgpack`
+2. Decompiled internal classes (`BaseApiClient`, `BatchSender`, `TraceSerializer`, `DotEnvLoader`) show single-letter class names and all strings as `D.s(new byte[]{...}, key)` calls
+3. Demo app (`rag-context-propagation`) runs without changes, `curl` returns valid response, traces appear on BrowserStack dashboard
+4. `/api/public/traces/{id}` returns full trace data proving end-to-end delivery
+5. Adding a new instrumentation (e.g., Bedrock) requires zero changes to `proguard-rules.pro` or `StringEncryptTask`
+
+---
+
+# Part 2 — What We Built
+
+## Tool choice
+
+We evaluated 4 approaches and chose **ProGuard + custom ASM string encryption**:
+
+| Tool | Identifier obfuscation | String encryption | Cost | Maintenance per new instrumentation |
+|---|---|---|---|---|
+| ProGuard only | ✅ | ❌ | Free | None (wildcards) |
+| yGuard | ✅ | ❌ | Free | Medium (XML config) |
+| Zelix KlassMaster | ✅ | ✅ | $$$$/yr | None |
+| **ProGuard + custom ASM** | ✅ | ✅ | **Free** | **None (wildcards)** |
+
+Rationale: identifier-only (ProGuard alone) is insufficient in 2026 — strings are a roadmap for AI-assisted reverse engineering. Commercial tools (Zelix) cost $$$$. A custom ASM task (~500 lines total) gives string encryption for free with zero external dependencies beyond `org.ow2.asm:asm:9.7` (BSD, 50KB).
+
+See full comparison: `testops-sdk/docs/plans/2026-04-14-001-java-obfuscation-comparison.md`.
+
+## Build pipeline
+
+```
+compile (javac)
+    ↓
+shadowJar (relocate OkHttp/Jackson/msgpack to internal.*)
+    ↓
+proguardJar (ProGuard renames internal identifiers)
+    ↓ outputs: proguard-output.jar + mapping.txt
+    ↓
+encryptStrings (custom ASM task: encrypt string constants + merge internal/ + observe/ from shadowJar)
+    ↓ outputs: encrypted-output.jar
+    ↓
+validateObfuscatedJar (size check, plaintext leak check, decryptor presence, class presence, method presence)
+    ↓
+obfuscatedJar (final artifact)
+    ↓
+build/libs/browserstack-ai-sdk-java-{version}.jar       ← ship this
+build/libs/browserstack-ai-sdk-java-{version}-mapping.txt  ← keep for debugging
+```
+
+## Files added/modified
+
+| File | Purpose | PRD mapping |
+|---|---|---|
+| `build.gradle` (modified) | Adds obfuscation tasks: `proguardJar`, `encryptStrings`, `validateObfuscatedJar`, `obfuscatedJar`. Removes `sourcesJar`/`javadocJar` from publishing so IDEs decompile obfuscated bytecode instead of showing original source. | R1, R2, R3, R4, R5, R10 |
+| `proguard-rules.pro` | ProGuard configuration. `-dontshrink`, `-dontoptimize` to prevent ByteBuddy stack map corruption. Package-level `-keep` rules for public API, `observe/`, `eval/model/`, `tracing/model/`, `exceptions/`. Strips `LineNumberTable`, `LocalVariableTable`, `SourceFile` for minification. | R1, R3, R4, R5, R6, R8 |
+| `buildSrc/build.gradle` | Declares ASM dependency (`org.ow2.asm:asm:9.7`) for the custom encryption task and JUnit 5 (`org.junit.jupiter:junit-jupiter:5.11.0`) for the round-trip tests. | R2, R10 |
+| `buildSrc/.../StringEncryptTask.java` | Gradle task (`DefaultTask`) that reads the ProGuard output JAR, walks each `.class` entry, encrypts strings in non-keep packages, merges `internal/` + `observe/` from the shadowJar (to preserve ByteBuddy + Kotlin bytecode), and injects the decryptor class. Accepts configurable `keepPackages` input (driven by `excludedFromStringEncryption` in `build.gradle`). | R2, R4, R6 |
+| `buildSrc/.../StringEncryptVisitor.java` | ASM `ClassVisitor` that intercepts two types of string constants: (a) `LDC` bytecode instructions in method bodies; (b) `static final String` fields with `ConstantValue` attributes. Replaces both with `D.s(new byte[]{...}, key)` calls. Each string gets a random 32-bit key. Encryption uses full-key rotation + golden ratio mixing constant (`0x9E3779B9`). | R2, R7 |
+| `buildSrc/.../DecryptorGenerator.java` | Generates the runtime decryptor class `com/browserstack/aisdk/internal/D` using ASM. Contains one public static method `s(byte[], int) → String` that reverses the encryption. Must match `StringEncryptVisitor.encrypt()` exactly (any mismatch breaks the SDK at class load). | R2 |
+| `buildSrc/.../SafeClassWriter.java` | Custom `ClassWriter` override that handles ProGuard's stack map frame corruption (ProGuard bug #647). Falls back to `java/lang/Object` when ASM can't resolve obfuscated type hierarchies during `COMPUTE_FRAMES`. Set `-Dobfuscation.debug=true` to log fallback occurrences. | R1, R4 |
+| `buildSrc/src/test/.../EncryptionRoundTripTest.java` | JUnit 5 round-trip tests verifying that `StringEncryptVisitor.encrypt()` and `DecryptorGenerator`'s emitted bytecode are mirror operations. 14 tests cover ASCII, Unicode/emoji, long strings (>32 chars), special chars, and edge keys (0, MIN_VALUE, MAX_VALUE, ±1). Tests both a Java replica AND the actual generated `D.class` bytecode loaded via reflection. Catches encrypt/decrypt mismatch at build time before the SDK ships broken. | R2, R10 |
+| `release-java.sh` | Release script — branch check, version bump, build, tag, artifact copy. Same pattern as `release-nodejs.sh`. | R8 |
+
+## How each requirement is satisfied
+
+### R1 — Identifier obfuscation
+
+**Implementation:** ProGuard with `-dontshrink -dontoptimize` and package-level keep rules.
+
+**Evidence (from `mapping.txt`):**
+```
+com.browserstack.aisdk.api.BaseApiClient -> com.browserstack.aisdk.a.a
+com.browserstack.aisdk.tracing.BatchSender -> com.browserstack.aisdk.tracing.a
+com.browserstack.aisdk.tracing.TraceSerializer -> com.browserstack.aisdk.tracing.b
+com.browserstack.aisdk.config.DotEnvLoader -> com.browserstack.aisdk.config.a
+```
+
+Decompiled `BatchSender`:
+```java
+public class com.browserstack.aisdk.tracing.a {    // was BatchSender
+    static final int a;                             // was MAX_BATCH_SIZE
+    static final long b;                            // was FLUSH_INTERVAL_MS
+    private List<byte[]> l;                         // was buffer
+    private Object m;                               // was lock
+    public void a(byte[] bArr) { ... }              // was enqueue
+    private void b() { ... }                        // was flush
+}
+```
+
+### R2 — String encryption
+
+**Implementation:** Custom ASM `StringEncryptVisitor` that intercepts `LDC` instructions and `static final String` `ConstantValue` attributes. Each string encrypted with `plain[i] ^ (key >>> (i & 31)) ^ (key * (i + 1) * 0x9E3779B9)`. Runtime decryptor `D.class` generated via ASM bytecode (see `DecryptorGenerator`).
+
+**Before:**
+```java
+.header("Authorization", config.getAuthHeader())
+static final String a = "https://evals-api.browserstack.com";
+```
+
+**After (decompiled):**
+```java
+.header(D.s(new byte[]{-47,-23,...}, -679050352), config.getAuthHeader())
+static final String a = D.s(new byte[]{-8,-35,...}, -1669155184);
+```
+
+**Verified by:**
+1. `./gradlew :buildSrc:test` — 14 JUnit round-trip tests in `EncryptionRoundTripTest` exercise both a Java replica AND the generated `D.class` bytecode loaded via reflection. Catches any drift between `StringEncryptVisitor.encrypt()` and `DecryptorGenerator` at build time.
+2. `./gradlew validateObfuscatedJar` — string grep on the final JAR confirms zero plaintext occurrences of 9 sensitive strings (URLs, env vars, headers, brand).
+
+### R3 — Preserve public API
+
+**Implementation:** `-keep` rules with `{ public *; protected *; }` wildcards for user-facing classes:
+- `TestOps`, `Media`, `TestOpsConfig`
+- `TraceManager`, `Trace`, `Span`, `Generation`, `Event`
+- `com.browserstack.aisdk.eval.*` (DatasetsClient, ExperimentsClient, etc.)
+
+**Verified by:** `./gradlew validateObfuscatedJar` checks that these classes exist in the JAR with expected method names. Demo app compiles and runs unchanged.
+
+### R4 — Preserve ByteBuddy auto-tracing
+
+**Implementation:** Two-part solution:
+1. `-keep class com.browserstack.aisdk.observe.** { *; }` — ProGuard keeps all members
+2. `internal/` + `observe/` **filtered out of ProGuard input entirely** (via `-injars` filter) because ProGuard corrupts stack map frames in Kotlin-derived classes. `StringEncryptTask` merges them back pristine from the shadowJar.
+
+**Verified by:** Demo app's `AutoTracer: instrumented com.openai.services.blocking.chat.ChatCompletionServiceImpl` log line + OpenAI calls auto-traced end-to-end.
+
+### R5 — Preserve Jackson serialization
+
+**Implementation:** `-keep class com.browserstack.aisdk.eval.model.** { *; }` and `-keep class com.browserstack.aisdk.tracing.model.** { *; }` keep ALL members (including private fields). The `StringEncryptTask.KEEP_PACKAGES` also excludes these from string encryption.
+
+**Verified by:** `sdk.datasets().list()` returns populated objects. API response deserialization works in integration tests.
+
+### R6 — Zero config for new instrumentations
+
+**Implementation:** Package-level wildcards throughout:
+- `com.browserstack.aisdk.observe.**` — covers any new advice class
+- `com.browserstack.aisdk.eval.*` — covers any new eval client
+- `com.browserstack.aisdk.eval.model.**` — covers any new response model
+
+**Verified by:** Adding a hypothetical `BedRockAdvice` to `observe/` would require ZERO changes to `proguard-rules.pro` or `KEEP_PACKAGES`.
+
+### R7 — Zero source code changes
+
+**Implementation:** All obfuscation happens as post-compilation bytecode transforms. No annotations, no preprocessor directives, no code generation at source level.
+
+**Verified by:** `git diff` on the SDK source code shows zero changes to existing source files for obfuscation purposes (only the `buildSrc/` Java files are new, and those are build tooling).
+
+### R8 — Debug mapping file
+
+**Implementation:** ProGuard's `-printmapping` outputs `build/obfuscation/mapping.txt`. The `obfuscatedJar` task copies it next to the JAR as `browserstack-ai-sdk-java-{version}-mapping.txt`.
+
+**Usage:** Decode obfuscated stack traces with:
+```bash
+java -jar retrace.jar mapping.txt stacktrace.txt
+```
+
+### R9 — Parity with Node.js / Python SDKs
+
+| Aspect | Node.js | Python | Java (this PR) |
+|---|---|---|---|
+| Identifier obfuscation | javascript-obfuscator → `_0x[hex]` | OPy → `_obf_` suffix | ProGuard → `a`, `b`, `c` |
+| String encryption | String array shuffle/rotate | OPy `obfuscate_strings` | ASM → `D.s(byte[], key)` |
+| Brand replacement | `REPLACEMENT_MAP` (100+ entries) | `string_replacer.py` (100+ entries) | ASM encrypts the 1 langfuse ref automatically |
+| Validation | Pattern checks + import tests | Integration tests on built package | Size + string grep + class loading + method checks |
+| New instrumentation effort | Update `RESERVED_NAMES` (1 line) | Update 3 files | **Nothing** (wildcards) |
+| Config files | 1 (`rollup.config.mjs`) | 4+ | 2 (`proguard-rules.pro` + `KEEP_PACKAGES`) |
+
+### R10 — Validation in CI
+
+**Implementation:** `validateObfuscatedJar` Gradle task runs after `encryptStrings`. Checks:
+1. JAR size > configurable threshold (default 50KB) — detects ProGuard failure
+2. No plaintext occurrences of 9 sensitive strings (`langfuseMedia`, env vars, URLs, endpoint, content-type)
+3. Decryptor class `D.class` present in JAR
+4. 12 required classes exist with expected names (public API + ByteBuddy advice)
+5. `TestOps` has expected method names (`builder`, `fromEnv`, `observe`)
+6. Mapping file exists and is non-empty
+
+**Verified by:** Running `./gradlew obfuscatedJar` fails the build if any check trips.
+
+## End-to-end verification (2026-04-15)
+
+Trace ID `dbe2666a-7084-404f-89bc-fab53f1dcb9a` from a real test run:
+
+1. ✅ Demo app started with obfuscated SDK
+2. ✅ ByteBuddy instrumented `ChatCompletionServiceImpl` at runtime
+3. ✅ OpenAI calls auto-traced — `recording generation — provider=openai, model=gpt-4o-mini`
+4. ✅ `BatchSender: sent 2 items` to `evals-ingestion.browserstack.com`
+5. ✅ REST API `/api/public/traces/dbe2666a-...` returned full trace with metadata, observations, and custom attributes
+6. ✅ Strings check: zero leaks of sensitive strings in final JAR
+7. ✅ Decompile check: `cfr-decompiler` shows obfuscated class names + `D.s(byte[], key)` everywhere
+
+---
+
+# Part 3 — Verification Commands
+
+After ANY change to the obfuscation pipeline (StringEncryptTask, DecryptorGenerator, SafeClassWriter, proguard-rules.pro, build.gradle obfuscation tasks), run this sequence:
+
+## Recommended check sequence
+
+```bash
+cd ~/Git/testAI/testops-sdk/testops-java-wrapper
+
+# 1. Algorithm correctness — round-trip encrypt/decrypt tests (~5s)
+JAVA_HOME=$HOME/.sdkman/candidates/java/11.0.30-tem ./gradlew :buildSrc:test
+
+# 2. Build + JAR validation — no plaintext leaks, public API intact, decryptor present
+JAVA_HOME=$HOME/.sdkman/candidates/java/11.0.30-tem ./gradlew clean obfuscatedJar publishToMavenLocal -x test -x javadoc
+
+# 3. Unit tests on un-obfuscated SDK — catches source-code regressions
+JAVA_HOME=$HOME/.sdkman/candidates/java/11.0.30-tem ./gradlew test
+
+# 4. Demo app smoke test — catches runtime issues (VerifyError, ByteBuddy failures, broken Jackson)
+cd ~/demo-application/rag-context-propagation
+rm -rf build .gradle ~/.gradle/caches/modules-2/files-2.1/com.browserstack/
+JAVA_HOME=$HOME/.sdkman/candidates/java/17.0.18-tem ./gradlew classes --refresh-dependencies
+JAVA_HOME=$HOME/.sdkman/candidates/java/17.0.18-tem ./gradlew service1
+# In another terminal:
+curl -s "http://localhost:8081/ask?query=test" | jq .
+
+# 5. Backend trace verification — catches network/auth/serialization issues
+# Wait ~30-60s after curl, then query API with the trace.id from the carrier:
+PK="<public-key>" SK="<secret-key>" AUTH=$(echo -n "$PK:$SK" | base64)
+curl -s -H "Authorization: Basic $AUTH" "https://evals-api.browserstack.com/api/public/traces/<TRACE_ID>"
+```
+
+## What each step catches
+
+| Type of change | Step #1 (tests) | Step #2 (build) | Step #3 (unit) | Step #4 (demo) | Step #5 (backend) |
+|---|---|---|---|---|---|
+| Encryption algorithm | ✅ | ✅ | — | ✅ | — |
+| ProGuard keep rules | — | ✅ | — | ✅ | — |
+| `KEEP_PACKAGES` list | — | partial | — | ✅ | — |
+| ASM visitor logic | partial | ✅ | — | ✅ | ✅ |
+| Build pipeline (Gradle tasks) | — | ✅ | — | ✅ | — |
+| SDK source code | — | — | ✅ | ✅ | ✅ |
+
+## Test individually
+
+```bash
+# Single test
+./gradlew :buildSrc:test --tests "com.browserstack.build.EncryptionRoundTripTest.unicodeWithEmoji"
+
+# Verbose output
+./gradlew :buildSrc:test --info
+
+# Skip obfuscation for fast local builds
+./gradlew obfuscatedJar -PskipObfuscation
+```
+
+## Pre-merge checklist
+
+For obfuscation pipeline PRs, all 5 steps must pass before merge:
+
+- [ ] `:buildSrc:test` — 14/14 round-trip tests pass
+- [ ] `obfuscatedJar` — build succeeds, validation passes
+- [ ] `test` — SDK unit tests pass
+- [ ] Demo app starts without `VerifyError`, auto-tracing initializes
+- [ ] `curl` returns valid JSON with `BatchSender: sent N items` log
+- [ ] Backend API returns full trace data for the `trace.id` from the carrier
+
+---
+
+## Q: What about methods that don't have a signature in the keep namespaces? Anything not part of ProGuard keep is obfuscated, right?
+
+**Yes, correct.**
+
+### The rule (from ProGuard's perspective)
+
+```
+Is the class in a namespace listed in proguard-rules.pro with a -keep rule?
+├── NO  → everything obfuscated (class name + all methods + all fields)
+└── YES → check which -keep variant:
+          ├── -keep { *; }                         → keep class name + ALL members (public, protected, private, package-private)
+          ├── -keep { public *; protected *; }     → keep class name + public/protected only, PRIVATE + PACKAGE-PRIVATE OBFUSCATED
+          └── -keep (no body)                      → keep class name only, ALL members obfuscated
+```
+
+### Concrete examples from the SDK
+
+#### `TestOps.java` — rule: `-keep public class ... { public *; protected *; }`
+
+```java
+public final class TestOps {
+    public static TestOps fromEnv() { ... }        // ✅ kept — public, namespace kept
+    public TraceManager traceManager() { ... }     // ✅ kept — public
+    public void shutdown() { ... }                  // ✅ kept — public
+    private TraceManager traceManager;             // ❌ obfuscated → Field a
+    private DatasetsClient datasetsClient;         // ❌ obfuscated → Field b
+    private TestOps(TestOpsConfig config) { ... }   // ❌ obfuscated (private constructor)
+}
+```
+
+#### `BaseApiClient.java` — NOT in any -keep rule
+
+```java
+public abstract class BaseApiClient {               // ❌ class renamed → a.a
+    protected Request.Builder baseRequest(...) {...} // ❌ obfuscated
+    public static final MediaType JSON = ...;        // ❌ obfuscated (whole class not kept)
+    private RequestBody toRequestBody(...) {...}    // ❌ obfuscated
+}
+```
+
+Even though the method is `public`, it's obfuscated because the **class itself is not listed**. This is the key: class-level keep rules gate everything inside.
+
+#### `Observe.java` — rule: `-keep class com.browserstack.aisdk.observe.** { *; }`
+
+```java
+public final class Observe {
+    public static void setAttribute(...) { ... }   // ✅ kept
+    public static String getBaggage() { ... }      // ✅ kept
+    private static boolean isExcludedPrefix(...){..} // ✅ kept (because { *; })
+    private static volatile TraceManager traceManager; // ✅ kept (because { *; })
+}
+```
+
+The `{ *; }` wildcard keeps everything including private members — needed for ByteBuddy to inline the advice classes.
+
+### Two cases of obfuscation
+
+1. **Method's class is NOT in any keep rule** → whole class (including all methods, including public ones) gets obfuscated. Class name gets renamed.
+
+2. **Method's class IS in a keep rule, but the method is `private`** (and the rule is `{ public *; protected *; }`) → method gets obfuscated.
+
+### What happens when a method is obfuscated
+
+- Public method `flushHelper()` → renamed to `a()`
+- If users tried to call `.flushHelper()` → `NoSuchMethodError` at runtime
+- This is why we keep all public API methods
+- The method itself still exists (can't delete it, other code calls it) — just with a new name
+- Original name is gone — stored only in the mapping file for debugging
+
+---
+
+## Q: What about default (package-private) methods?
+
+Java has **4** visibility levels, not 3:
+
+| Modifier | Syntax | Match with `{ public *; protected *; }` | Match with `{ *; }` |
+|---|---|---|---|
+| `public` | `public void foo()` | ✅ Kept | ✅ Kept |
+| `protected` | `protected void foo()` | ✅ Kept | ✅ Kept |
+| `private` | `private void foo()` | ❌ Obfuscated | ✅ Kept |
+| **package-private** (default) | `void foo()` (no keyword) | ❌ **Obfuscated** | ✅ Kept |
+
+### Package-private = default
+
+When you write a method **without any modifier**, it's package-private (aka default):
+
+```java
+class Foo {
+    void helper() { ... }        // ← package-private (default)
+    public void api() { ... }
+    protected void hook() { ... }
+    private void util() { ... }
+}
+```
+
+ProGuard treats package-private the same as private for `-keep` purposes. The `public *; protected *;` wildcard ONLY matches those two explicit modifiers — default/package-private falls through to obfuscation.
+
+### To keep package-private members explicitly
+
+```proguard
+-keep class com.foo.Bar {
+    public *;
+    protected *;
+    !private !synthetic *;    // keep package-private (not private, not synthetic)
+}
+```
+
+Or just use `{ *; }` which keeps everything.
+
+### Current SDK status
+
+- `observe/`, `internal/`, `eval/model/`, `tracing/model/`, `exceptions/` use `{ *; }` — package-private members are kept
+- `TestOps`, `TraceManager`, etc. use `{ public *; protected *; }` — but no package-private methods exist in those classes, so it's safe
+- If a package-private method is added later to a class with `public *; protected *;`, it would be obfuscated
+
+---
+
+## Q: How did you decide what to keep in TestOps (and the SDK as a whole)?
+
+I made decisions based on **which classes users import and call directly** in their code. The demo app (`rag-context-propagation`) was the primary reference for real usage patterns.
+
+### Decision heuristic
+
+For each class/member, ask:
+
+| Question | If YES → |
+|---|---|
+| Does a user `import` this class? | Keep class + public methods |
+| Does a user call this method directly? | Keep method |
+| Does Jackson/Gson serialize this class? | Keep ALL members (`{ *; }`) |
+| Does reflection look up fields/methods by name? | Keep relevant members |
+| Is this bytecode inlined by ByteBuddy/CGLIB/etc.? | Keep ALL members (`{ *; }`) |
+| Does it appear in stack traces users debug? | Keep class name |
+| Is it an internal helper only called by SDK code? | **Don't list** → gets obfuscated |
+
+### Each keep rule, justified
+
+#### `-keep public class com.browserstack.aisdk.TestOps { public *; protected *; }`
+
+Evidence from demo app:
+```java
+import com.browserstack.aisdk.TestOps;
+TestOps sdk = TestOps.fromEnv();      // ← user calls this
+sdk.traceManager();                    // ← user calls this
+sdk.observe().init();                  // ← user calls this
+```
+Users call `TestOps.fromEnv()`, `TestOps.builder()`, `traceManager()`, `observe()`, etc. Keep public API.
+
+#### `-keep public class com.browserstack.aisdk.Media { public *; }`
+
+Users call `Media.fromBytes(...)`, `Media.fromFile(...)`, `.upload(...)` — needed for file uploads.
+
+#### `-keep public class com.browserstack.aisdk.config.TestOpsConfig { public *; }`
+
+Users may want to construct config manually:
+```java
+TestOpsConfig config = TestOpsConfig.builder().publicKey("...").build();
+```
+
+#### `-keep public class com.browserstack.aisdk.tracing.{TraceManager,Trace,Span,Generation,Event}`
+
+Manual tracing API — users call these for custom spans:
+```java
+Trace trace = sdk.traceManager().trace(...);
+Span span = trace.span(...);
+Generation gen = trace.generation(...);
+```
+
+#### `-keep public class com.browserstack.aisdk.eval.* { public *; protected *; }`
+
+The `sdk.datasets()`, `sdk.experiments()`, `sdk.prompts()` accessors return these client classes and users call their CRUD methods.
+
+#### `-keep class com.browserstack.aisdk.observe.** { *; }` (note: `{ *; }` — keep ALL members)
+
+This is different because **ByteBuddy inlines these classes into external bytecode at runtime**. If any member (including private) is renamed, the inlined code references a nonexistent method → `IllegalStateException`. Verified this empirically — we got `VerifyError` when `observe/` was obfuscated.
+
+#### `-keep class com.browserstack.aisdk.eval.model.** { *; }` and `tracing.model.**`
+
+Jackson uses reflection to map JSON fields to Java field names:
+```java
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class DatasetResponse {
+    private String name;        // ← Jackson reads JSON key "name" → this field
+    private String description;
+}
+```
+If `name` gets renamed to `a`, Jackson tries to set `a` from JSON `"name"` → deserialization breaks. Must keep ALL members.
+
+#### `-keep class com.browserstack.aisdk.exceptions.** { *; }`
+
+User-facing exceptions appear in their stack traces. If `ApiException` is renamed to `a`, users see `com.browserstack.aisdk.exceptions.a` in logs — confusing. Also, users write `catch (TestOpsException e)` in their code.
+
+#### `-keep class com.browserstack.aisdk.internal.** { *; }`
+
+These are relocated dependencies (OkHttp, Jackson, msgpack). We also exclude them from ProGuard input entirely because ProGuard corrupts Kotlin stack map frames. This rule is defensive.
+
+### What is intentionally NOT kept
+
+These are internal and get obfuscated (renamed to single letters):
+- `api.BaseApiClient` → `a.a` (internal HTTP wrapper)
+- `tracing.BatchSender` → `tracing.a` (internal batching)
+- `tracing.TraceSerializer` → `tracing.b` (internal msgpack)
+- `config.DotEnvLoader` → `config.a` (internal .env parser)
+
+The "keep" list is about **public contract + reflection targets**, not about hiding vs. not hiding. Everything not in the keep list still exists in the JAR — it's just renamed to be unrecognizable.
+
+---
+
+## Simple mental model
+
+```
+Public contract (users call these)   → put in a -keep rule with public/protected wildcard
+Internal helpers (SDK calls these)   → don't list them → automatically obfuscated
+ByteBuddy advice / Jackson models    → need { *; } to keep private members too
+Relocated Kotlin deps (internal/)    → exclude from ProGuard entirely, merge from shadowJar
+```
