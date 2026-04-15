@@ -1,8 +1,16 @@
 ---
 title: "Vercel AI SDK Auto-Tracing — Final"
+tags:
+  - reference
+  - instrumentation
+  - vercel-ai
+  - auto-tracing
+  - shipped
+  - observability
+  - otel
 type: reference
 status: shipped
-date: 2026-04-14
+date: 2026-04-15
 supersedes:
   - docs/vercel-ai-auto-tracing-overview.md
   - docs/vercel-ai-auto-tracing-overview-v2.md
@@ -15,15 +23,16 @@ supersedes:
 
 # Vercel AI SDK Auto-Tracing — Final
 
-This is the single source of truth for the Vercel AI SDK instrumentation in `@browserstack/ai-sdk`. It consolidates the implementation plan, the architectural decisions, the upstream issues we've hit, and every fix shipped through PR #961.
+> [!summary]
+> This is the **single source of truth** for the [[Vercel AI SDK]] instrumentation in `@browserstack/ai-sdk`. It consolidates the implementation plan, architectural decisions, upstream issues, and every fix shipped through PR #961.
 
 ---
 
 ## 1. Overview
 
-### What this is
+### What This Is
 
-A wrapper that adds OpenTelemetry tracing to every call made through the [Vercel AI SDK](https://ai-sdk.dev) (`ai` npm package) — `generateText`, `streamText`, `generateObject`, `streamObject`, `embed`, `embedMany`, `generateImage`, `rerank`, plus `Agent` and `ToolLoopAgent` classes.
+A wrapper that adds [[OpenTelemetry]] tracing to every call made through the [[Vercel AI SDK]] (`ai` npm package) — `generateText`, `streamText`, `generateObject`, `streamObject`, `embed`, `embedMany`, `generateImage`, `rerank`, plus `Agent` and `ToolLoopAgent` classes.
 
 ### User API
 
@@ -44,94 +53,136 @@ const result = await generateText({
 
 Calling `Observe.wrapVercelAI(ai)` returns a Proxy over the `ai` module. Every wrapped function emits `vercel-ai.*` OTel spans automatically.
 
-### Versions covered
+### Versions Covered
 
 | `ai` package | AI SDK version | Status |
-|---|---|---|
-| `ai@4.x` | AI SDK 4 | Best-effort (v4 compatibility layer) |
-| `ai@5.x` | AI SDK 5 | Full support |
-| `ai@6.x` | AI SDK 6 | Full support (current default) |
-| `ai@7.x-beta` | AI SDK 7 | Out of scope (separate plan — will use `registerTelemetryIntegration`) |
+| --- | --- | --- |
+| `ai@4.x` | AI SDK 4 | Best-effort ([[#5. v4 Compatibility]]) |
+| `ai@5.x` | AI SDK 5 | ✅ Full support |
+| `ai@6.x` | AI SDK 6 | ✅ Full support (current default) |
+| `ai@7.x-beta` | AI SDK 7 | ❌ Out of scope (separate plan — will use `registerTelemetryIntegration`) |
 
-`v4 + v5 + v6` covers ~95% of `ai`-package downloads.
+> [!note]
+> `v4 + v5 + v6` covers ~95% of `ai`-package downloads.
 
 ---
 
-## 2. What we instrument
+## 2. What We Instrument
 
-### Top-level functions and span names
+### Top-Level Functions and Span Names
 
 | User-facing call | Top-level span | Per-LLM-call child span | Tool child spans |
-|---|---|---|---|
-| `generateText` | `vercel-ai.generateText` | `vercel-ai.doGenerate` | `vercel-ai.tool.<name>` |
-| `streamText` | `vercel-ai.streamText` | `vercel-ai.doStream` | `vercel-ai.tool.<name>` |
+| --- | --- | --- | --- |
+| `generateText` | `vercel-ai.generateText` | `vercel-ai.doGenerate` | `vercel-ai.tool.<n>` |
+| `streamText` | `vercel-ai.streamText` | `vercel-ai.doStream` | `vercel-ai.tool.<n>` |
 | `generateObject` | `vercel-ai.generateObject` | `vercel-ai.doGenerate` | — |
 | `streamObject` | `vercel-ai.streamObject` | `vercel-ai.doStream` | — |
 | `embed` | `vercel-ai.embed` | — | — |
 | `embedMany` | `vercel-ai.embedMany` | — | — |
 | `generateImage` | `vercel-ai.generateImage` | — | — |
 | `rerank` | `vercel-ai.rerank` | — | — |
-| `Agent.generate` / `ToolLoopAgent.generate` | `vercel-ai.agent.generate` | `vercel-ai.doGenerate` (one per loop step) | `vercel-ai.tool.<name>` (one per tool call) |
-| `Agent.stream` / `ToolLoopAgent.stream` | `vercel-ai.agent.stream` | `vercel-ai.doStream` (one per loop step) | `vercel-ai.tool.<name>` |
+| `Agent.generate` / `ToolLoopAgent.generate` | `vercel-ai.agent.generate` | `vercel-ai.doGenerate` (one per loop step) | `vercel-ai.tool.<n>` (one per tool call) |
+| `Agent.stream` / `ToolLoopAgent.stream` | `vercel-ai.agent.stream` | `vercel-ai.doStream` (one per loop step) | `vercel-ai.tool.<n>` |
 
-### Why `doGenerate` / `doStream` exist as their own spans
+### Why `doGenerate` / `doStream` Exist as Their Own Spans
 
-In an agent loop, the LLM is called multiple times — decide → execute tool → decide again → execute another tool → final answer. Each of those LLM calls goes through `model.doGenerate()` (or `model.doStream()` for streaming). We patch these methods on the model instance so each individual LLM call produces its own child span — same approach as Braintrust's `wrapAISDK`.
+> [!info]
+> In an agent loop, the LLM is called multiple times — decide → execute tool → decide again → execute another tool → final answer. Each of those LLM calls goes through `model.doGenerate()` (or `model.doStream()` for streaming). We patch these methods on the model instance so each individual LLM call produces its own child span — same approach as [[Braintrust]]'s `wrapAISDK`.
+>
+> For plain (non-agent) `generateText`, you get a redundant `generateText` parent + one `doGenerate` child. That's intentional consistency — matches [[Braintrust]].
 
-For plain (non-agent) `generateText`, you get a redundant `generateText` parent + one `doGenerate` child. That's intentional consistency — same as Braintrust.
+### Span Type Classification (SPAN vs GENERATION)
 
-### Span hierarchy by scenario
+> [!important]
+> Parent wrapper spans are classified as **SPAN**; the per-LLM-call child spans are classified as **GENERATION**. This split is what produces a clean "agent = span, LLM call = generation" trace in the UI, and it's what prevents token cost from being double-counted.
+
+**Classification rules:**
+
+| Span | UI Type | `SpanKind` | Carries `gen_ai.*`? | Carries cost? |
+| --- | --- | --- | --- | --- |
+| `vercel-ai.generateText` | **SPAN** | `INTERNAL` | ❌ | ❌ |
+| `vercel-ai.streamText` | **SPAN** | `INTERNAL` | ❌ | ❌ |
+| `vercel-ai.generateObject` | **SPAN** | `INTERNAL` | ❌ | ❌ |
+| `vercel-ai.streamObject` | **SPAN** | `INTERNAL` | ❌ | ❌ |
+| `vercel-ai.agent.generate` | **SPAN** | `INTERNAL` | ❌ | ❌ |
+| `vercel-ai.agent.stream` | **SPAN** | `INTERNAL` | ❌ | ❌ |
+| `vercel-ai.doGenerate` | **GENERATION** | `CLIENT` | ✅ | ✅ |
+| `vercel-ai.doStream` | **GENERATION** | `CLIENT` | ✅ | ✅ |
+| `vercel-ai.tool.<n>` | **SPAN** | `INTERNAL` | only `gen_ai.operation.name: 'execute_tool'` | ❌ |
+| `vercel-ai.embed` / `embedMany` | **GENERATION** | `CLIENT` | ✅ | ✅ |
+| `vercel-ai.generateImage` | **GENERATION** | `CLIENT` | ✅ | ✅ |
+| `vercel-ai.rerank` | **GENERATION** | `CLIENT` | ✅ | ✅ |
+
+> [!warning] Backend classification rule
+> The backend classifies **any span with `gen_ai.*` attributes as GENERATION**, regardless of `SpanKind`. This is why the wrapper must **strip all `gen_ai.*` attributes from parent wrapper spans** — simply setting `SpanKind.INTERNAL` is not enough. The wrapper keeps only `vercel_ai.*` and `AIOPS_INTERNAL.*` attributes on parent spans.
+
+**Why `embed` / `embedMany` / `generateImage` / `rerank` are exceptions:**
+These have no `doGenerate` child span (they're single-call operations). If we stripped `gen_ai.*` from their parent, the LLM metadata would be lost entirely. We keep `gen_ai.*` on the parent specifically because there is no child to carry it.
+
+**Why cost only appears on the GENERATION child:**
+The cost engine multiplies token counts by model pricing. If both parent and child carried `gen_ai.usage.*`, cost would be computed twice and aggregated — the trace would show 2× the true cost. Removing `gen_ai.usage.*` from parents fixes this at the source. See [[#D12. Parent Spans as SPAN, Not GENERATION]].
+
+### Span Hierarchy by Scenario
 
 **Plain generateText with tools** (single LLM call, may emit parallel tool calls):
+
 ```
-vercel-ai.generateText
-├── vercel-ai.doGenerate              ← LLM decides "call X, Y, Z"
-├── vercel-ai.tool.X
-├── vercel-ai.tool.Y
-└── vercel-ai.tool.Z
+vercel-ai.generateText                  ← SPAN
+├── vercel-ai.doGenerate                ← GENERATION (LLM decides "call X, Y, Z")
+├── vercel-ai.tool.X                    ← SPAN
+├── vercel-ai.tool.Y                    ← SPAN
+└── vercel-ai.tool.Z                    ← SPAN
 ```
 
 **Agent with multi-step loop** (3 LLM calls + 2 tool calls):
+
 ```
-vercel-ai.agent.generate
-├── vercel-ai.doGenerate              ← step 1: LLM decides "call calculator"
-├── vercel-ai.tool.calculator
-├── vercel-ai.doGenerate              ← step 2: LLM decides "call calculator again"
-├── vercel-ai.tool.calculator
-└── vercel-ai.doGenerate              ← step 3: final answer (finishReason=stop)
+vercel-ai.agent.generate                ← SPAN
+├── vercel-ai.doGenerate                ← GENERATION (step 1: "call calculator")
+├── vercel-ai.tool.calculator           ← SPAN
+├── vercel-ai.doGenerate                ← GENERATION (step 2: "call calculator again")
+├── vercel-ai.tool.calculator           ← SPAN
+└── vercel-ai.doGenerate                ← GENERATION (step 3: final answer)
 ```
 
-**Multi-agent with sub-agents nested inside tools**:
+**Multi-agent with sub-agents nested inside tools:**
+
 ```
-vercel-ai.agent.generate (coordinator)
-├── vercel-ai.doGenerate              ← coordinator step 1
-├── vercel-ai.tool.askResearcher
-│   └── vercel-ai.agent.generate      ← researcher SUB-AGENT
-│       └── vercel-ai.doGenerate      ← sub-agent's LLM call
-├── vercel-ai.doGenerate              ← coordinator step 2
-├── vercel-ai.tool.askWriter
-│   └── vercel-ai.agent.generate      ← writer SUB-AGENT
-│       └── vercel-ai.doGenerate      ← sub-agent's LLM call
-└── vercel-ai.doGenerate              ← coordinator final answer
+vercel-ai.agent.generate (coordinator)  ← SPAN
+├── vercel-ai.doGenerate                ← GENERATION (coordinator step 1)
+├── vercel-ai.tool.askResearcher        ← SPAN
+│   └── vercel-ai.agent.generate        ← SPAN (researcher SUB-AGENT)
+│       └── vercel-ai.doGenerate        ← GENERATION (sub-agent's LLM call)
+├── vercel-ai.doGenerate                ← GENERATION (coordinator step 2)
+├── vercel-ai.tool.askWriter            ← SPAN
+│   └── vercel-ai.agent.generate        ← SPAN (writer SUB-AGENT)
+│       └── vercel-ai.doGenerate        ← GENERATION (sub-agent's LLM call)
+└── vercel-ai.doGenerate                ← GENERATION (coordinator final answer)
 ```
 
 ---
 
-## 3. What we capture per span
+## 3. What We Capture Per Span
 
-### Request attributes (all spans)
+> [!note] Attribute scope
+> The tables below list every attribute the wrapper can produce. Scope rules:
+> - `gen_ai.*` attributes live **only** on `doGenerate` / `doStream` children **and** on single-call leaf operations (`embed`, `embedMany`, `generateImage`, `rerank`). They are **NOT** set on `generateText`, `streamText`, `generateObject`, `streamObject`, `agent.generate`, or `agent.stream` parent wrapper spans.
+> - `vercel_ai.*` and `AIOPS_INTERNAL.*` attributes live on **all** wrapper spans (parent and child).
+> - Cost is computed from `gen_ai.usage.*`, so cost follows the `gen_ai.*` placement — child only for text/object/agent flows, parent for embed/image/rerank.
+
+### Request Attributes
 
 | Attribute | Source | Notes |
-|---|---|---|
-| `gen_ai.system` | `model.provider` / `providerId` | e.g. `openai.chat`, `anthropic` |
-| `gen_ai.request.model` | `model.modelId` | e.g. `gpt-4.1-mini` |
-| `gen_ai.operation.name` | `chat` / `embeddings` / `image_generation` / `agent` / `tool` | OTel semantic convention |
-| `gen_ai.request.temperature` | `options.temperature` | |
-| `gen_ai.request.max_tokens` | `options.maxOutputTokens ?? options.maxTokens` | v4 fallback |
-| `gen_ai.request.top_p` / `top_k` | `options.topP` / `topK` | |
-| `gen_ai.request.frequency_penalty` / `presence_penalty` | passed through | |
-| `gen_ai.request.seed` | `options.seed` | |
-| `gen_ai.request.stop_sequences` | `options.stopSequences` | JSON array |
+| --- | --- | --- |
+| `gen_ai.system` | `model.provider` / `providerId` | e.g. `openai.chat`, `anthropic` — child/leaf only |
+| `gen_ai.request.model` | `model.modelId` | e.g. `gpt-4.1-mini` — child/leaf only |
+| `gen_ai.operation.name` | `chat` / `embeddings` / `image_generation` / `execute_tool` | Tool spans use `execute_tool` (per OTel GenAI semconv) |
+| `gen_ai.request.temperature` | `options.temperature` | child/leaf only |
+| `gen_ai.request.max_tokens` | `options.maxOutputTokens ?? options.maxTokens` | v4 fallback — child/leaf only |
+| `gen_ai.request.top_p` / `top_k` | `options.topP` / `topK` | child/leaf only |
+| `gen_ai.request.frequency_penalty` / `presence_penalty` | passed through | child/leaf only |
+| `gen_ai.request.seed` | `options.seed` | child/leaf only |
+| `gen_ai.request.stop_sequences` | `options.stopSequences` | JSON array — child/leaf only |
 | `vercel_ai.tool_choice` | `options.toolChoice` | `auto` / `none` / `required` / `{type: 'tool', toolName}` |
 | `vercel_ai.schema_name` | `options.schemaName` | generateObject only |
 | `vercel_ai.provider_options` | `options.providerOptions ?? options.providerMetadata` | JSON, truncated at 8KB with warn log |
@@ -139,130 +190,169 @@ vercel-ai.agent.generate (coordinator)
 | `vercel_ai.timeout_ms` | `options.timeout` | |
 | `AIOPS_INTERNAL.observation.input` | structured JSON | prompt, messages, system, tools, instructions; truncated if >50KB |
 
-### Response attributes
+### Response Attributes
 
 | Attribute | Source | Notes |
-|---|---|---|
-| `gen_ai.usage.input_tokens` | `usage.inputTokens ?? usage.promptTokens` | v4 fallback |
-| `gen_ai.usage.output_tokens` | `usage.outputTokens ?? usage.completionTokens` | |
-| `gen_ai.usage.total_tokens` | `usage.totalTokens` or sum | All 3 are coerced to finite numbers (see fix #2) |
-| `vercel_ai.usage.reasoning_tokens` | `usage.outputTokenDetails.reasoningTokens` | |
-| `vercel_ai.usage.cached_input_tokens` | `usage.inputTokenDetails.cachedTokens` / `cacheReadTokens` | both field names supported |
-| `vercel_ai.usage.cache_write_tokens` | `usage.inputTokenDetails.cacheCreationTokens` / `cacheWriteTokens` | both field names supported |
-| `vercel_ai.usage.no_cache_tokens` | `usage.inputTokenDetails.noCacheTokens` | OpenAI-specific |
-| `vercel_ai.usage.text_tokens` | `usage.outputTokenDetails.textTokens` | OpenAI-specific |
-| `gen_ai.response.finish_reasons` | normalized string from `result.finishReason` | v6 returns `{unified, raw}` object — we extract `.unified` (see fix) |
-| `gen_ai.response.id` | `result.response.id` | |
-| `gen_ai.response.model` | `result.response.modelId` | may differ from request model |
-| `vercel_ai.steps_count` | `result.steps.length` | multi-step agent runs |
-| `vercel_ai.time_to_first_token_ms` | measured | streams only |
-| `vercel_ai.gateway.cost` / `gateway.market_cost` | `result.providerMetadata.gateway.*` | when using Vercel AI Gateway |
+| --- | --- | --- |
+| `gen_ai.usage.input_tokens` | `usage.inputTokens ?? usage.promptTokens` | child/leaf only |
+| `gen_ai.usage.output_tokens` | `usage.outputTokens ?? usage.completionTokens` | child/leaf only |
+| `gen_ai.usage.total_tokens` | `usage.totalTokens` or sum | child/leaf only. All 3 coerced to finite numbers (see [[#D8. Number Coercion on Token Attributes]]) |
+| `vercel_ai.usage.reasoning_tokens` | `usage.outputTokenDetails.reasoningTokens` | child/leaf only |
+| `vercel_ai.usage.cached_input_tokens` | `usage.inputTokenDetails.cachedTokens` / `cacheReadTokens` | both field names supported — child/leaf only |
+| `vercel_ai.usage.cache_write_tokens` | `usage.inputTokenDetails.cacheCreationTokens` / `cacheWriteTokens` | both field names supported — child/leaf only |
+| `vercel_ai.usage.no_cache_tokens` | `usage.inputTokenDetails.noCacheTokens` | [[OpenAI]]-specific — child/leaf only |
+| `vercel_ai.usage.text_tokens` | `usage.outputTokenDetails.textTokens` | [[OpenAI]]-specific — child/leaf only |
+| `gen_ai.response.finish_reasons` | normalized string from `result.finishReason` | v6 returns `{unified, raw}` object — see [[#D7. `finishReason` Normalization]] — child/leaf only |
+| `gen_ai.response.id` | `result.response.id` | child/leaf only |
+| `gen_ai.response.model` | `result.response.modelId` | may differ from request model — child/leaf only |
+| `vercel_ai.steps_count` | `result.steps.length` | multi-step agent runs — parent span |
+| `vercel_ai.time_to_first_token_ms` | measured | streams only — parent span |
+| `vercel_ai.gateway.cost` / `gateway.market_cost` | `result.providerMetadata.gateway.*` | when using [[Vercel AI Gateway]] |
 | `vercel_ai.response.provider_metadata` | full `providerMetadata` blob | JSON, truncated at 8KB |
 | `AIOPS_INTERNAL.observation.output` | structured JSON | text, reasoning, toolCalls, stepsCount, finishReason |
 
-### Tool span attributes
+### Tool Span Attributes
 
 | Attribute | Source |
-|---|---|
-| `gen_ai.operation.name` | `tool` |
+| --- | --- |
+| `gen_ai.operation.name` | `execute_tool` (per OTel GenAI semconv) |
 | `vercel_ai.tool.name` | tool name from definition |
 | `AIOPS_INTERNAL.observation.input` | tool args (JSON) |
 | `AIOPS_INTERNAL.observation.output` | tool result (JSON) |
 
-### `doGenerate` / `doStream` span attributes
+> [!note]
+> Tool spans carry **only** `gen_ai.operation.name` from the `gen_ai.*` namespace. No model/usage/request attributes — tools don't call the LLM themselves. The `execute_tool` value keeps the span out of the GENERATION bucket (backend treats only `gen_ai.system` + usage as generation-typing signals in practice).
 
-Same shape as the top-level span (since it's just one LLM call): `gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.*`, `gen_ai.response.*`, `OBSERVATION_INPUT`, `OBSERVATION_OUTPUT`. Allows per-LLM-call drilldown.
+### `doGenerate` / `doStream` Span Attributes
+
+Same shape as a parent LLM call would have carried pre-split: `gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.*`, `gen_ai.response.*`, `OBSERVATION_INPUT`, `OBSERVATION_OUTPUT`. This is where cost is attributed. Allows per-LLM-call drilldown inside an agent loop.
 
 ---
 
-## 4. Architectural decisions
+## 4. Architectural Decisions
 
-### D1. Import wrapping over prototype patching
+### D1. Import Wrapping Over Prototype Patching
 
 Three approaches were considered:
 
 | Approach | Provider-agnostic | Full SDK data | ESM + CJS | Zero-config |
-|---|---|---|---|---|
-| CJS require cache patching | Yes | Yes | CJS only | Yes |
-| Provider prototype patching (`doGenerate`/`doStream`) | No (hardcoded list) | No (lossy) | Yes | Yes |
-| **Import wrapping (chosen)** | **Yes** | **Yes** | **Yes** | **One line** |
+| --- | --- | --- | --- | --- |
+| CJS require cache patching | ✅ | ✅ | CJS only | ✅ |
+| Provider prototype patching (`doGenerate`/`doStream`) | ❌ (hardcoded list) | ❌ (lossy) | ✅ | ✅ |
+| **Import wrapping (chosen)** | ✅ | ✅ | ✅ | One line |
 
-**Why import wrapping won:**
-- Captures full SDK-level data (prompt, messages, tools, totalUsage, steps_count) — prototype patching loses these
-- Provider-agnostic — no hardcoded provider list
-- Works for both CJS and ESM out of the box
-- Trade-off: user adds one line `Observe.wrapVercelAI(ai)` instead of zero. Same pattern as Braintrust's `wrapAISDK(ai)`.
+> [!tip] Why import wrapping won
+> - Captures full SDK-level data (prompt, messages, tools, totalUsage, steps_count) — prototype patching loses these
+> - Provider-agnostic — no hardcoded provider list
+> - Works for both CJS and ESM out of the box
+> - Trade-off: user adds one line `Observe.wrapVercelAI(ai)` instead of zero. Same pattern as [[Braintrust]]'s `wrapAISDK(ai)`.
 
-**Lesson learned:** The original plan proposed zero-config auto-tracing by patching ESM standalone function exports. ESM bindings are immutable live references — they cannot be replaced from outside the module. This was the single biggest architectural miss in the project. See `references/sdk-instrumentation-lessons.md` §1a.
+> [!warning] Lesson learned
+> The original plan proposed zero-config auto-tracing by patching ESM standalone function exports. ESM bindings are immutable live references — they cannot be replaced from outside the module. This was the single biggest architectural miss in the project. See `references/sdk-instrumentation-lessons.md` §1a.
 
-### D2. Per-LLM-call `doGenerate` / `doStream` spans (added later)
+### D2. Per-LLM-Call `doGenerate` / `doStream` Spans (added later)
 
-When agents loop through multiple tool calls, the user wants to see each LLM round-trip individually — not just an aggregated agent span. Braintrust does this; we initially didn't.
+When agents loop through multiple tool calls, the user wants to see each LLM round-trip individually — not just an aggregated agent span. [[Braintrust]] does this; we initially didn't.
 
 **Implementation:** `wrapLanguageModel(tracer, model)` patches `model.doGenerate` and `model.doStream` in place using a `Symbol.for('vercel-ai.language-model.wrapped')` marker for idempotency. Detection: model must have BOTH `doGenerate` AND `doStream` methods (rules out EmbeddingModel, ImageModel, RerankingModel automatically).
 
-**Trade-off:** plain (non-agent) `generateText` now produces a parent + one redundant `doGenerate` child. Acceptable for consistency — matches Braintrust's behavior.
+**Trade-off:** plain (non-agent) `generateText` now produces a parent + one redundant `doGenerate` child. Acceptable for consistency — matches [[Braintrust]]'s behavior.
 
-### D3. Don't mutate user tool objects (root fix)
+### D3. Don't Mutate User Tool Objects (root fix)
 
-Initial implementation mutated `tool.execute` in place on the agent instance, so the agent's internal `generateText` call would emit tool spans. **Side effect:** if the same tool was reused later in a plain `generateText`, the existing wrap would compose with our new wrap → nested duplicate spans.
+> [!danger] The problem
+> Initial implementation mutated `tool.execute` in place on the agent instance, so the agent's internal `generateText` call would emit tool spans. **Side effect:** if the same tool was reused later in a plain `generateText`, the existing wrap would compose with our new wrap → nested duplicate spans.
 
 **Root fix:** in `createAgentClassWrapper`'s construct trap, build a NEW tools object with wrapped clones, then replace `instance.settings.tools` (the agent's internal storage). The user's original tool objects stay untouched.
 
 Verified by `test-mutation-check.cjs`:
+
 ```js
 const originalRef = weatherTool.execute;
 new ToolLoopAgent({ tools: { weatherTool } });
 weatherTool.execute === originalRef  // ✅ true after fix
 ```
 
-### D4. No per-step LLM spans via `onStepFinish`
+### D4. No Per-Step LLM Spans via `onStepFinish`
 
 Considered injecting `onStepFinish` to emit a span per agent step. Rejected because:
-- Braintrust and Google ADK don't do it
+
+- [[Braintrust]] and [[Google ADK]] don't do it
 - The information lives on the parent agent span (`steps_count`, aggregated `usage`) plus the per-`doGenerate` spans
 - Adds visual clutter for limited extra value
 
-### D5. `wrapLanguageModel` skips embedding/image/rerank models
+### D5. `wrapLanguageModel` Skips Embedding/Image/Rerank Models
 
 These have a single API call per user call, not a loop. Their top-level span (`vercel-ai.embed`, `vercel-ai.generateImage`, `vercel-ai.rerank`) already captures everything. A `doGenerate`-style child would be 100% redundant. Plus their model interfaces don't have `doStream` so detection naturally skips them.
 
-### D6. Stream wrapper handles `onError` / `onAbort`
+### D6. Stream Wrapper Handles `onError` / `onAbort`
 
-If a stream errors mid-flight (rate limit, network drop) or is aborted, `onFinish` never fires → span would never end → memory leak + the trace shows a hanging span forever.
+> [!warning]
+> If a stream errors mid-flight (rate limit, network drop) or is aborted, `onFinish` never fires → span would never end → memory leak + the trace shows a hanging span forever.
 
 **Fix:** patch `onError` and `onAbort` callbacks alongside `onFinish` / `onChunk`. Use a `spanEnded` flag so the span ends exactly once across all callbacks.
 
-### D7. `finishReason` normalization
+### D7. `finishReason` Normalization
 
 In v6, `LanguageModelV2.doGenerate()` and `onFinish` events return `finishReason` as `{ unified: 'stop', raw: 'stop' }` instead of a string. Setting an object as a span attribute renders as `"[object Object]"` in the UI.
 
 **Fix:** central `extractFinishReason()` helper returns `fr.unified ?? fr.raw ?? fr` if the input is a string, otherwise normalizes to a string. Used everywhere we set `gen_ai.response.finish_reasons`.
 
-### D8. Number coercion on token attributes
+### D8. Number Coercion on Token Attributes
 
-Some SDK versions/providers occasionally return object-shaped values (e.g., `{}`) for token fields. Doing `inputTokens + outputTokens` on objects produces the JS classic `"[object Object][object Object]"` and gets stored as a span attribute string. Coerce to finite numbers everywhere via `asNumber(v) = typeof v === 'number' && Number.isFinite(v) ? v : undefined`.
+Some SDK versions/providers occasionally return object-shaped values (e.g., `{}`) for token fields. Doing `inputTokens + outputTokens` on objects produces the JS classic `"[object Object][object Object]"` and gets stored as a span attribute string.
 
-### D9. Image mask binary protection
+**Fix:** coerce to finite numbers everywhere via `asNumber(v) = typeof v === 'number' && Number.isFinite(v) ? v : undefined`.
+
+### D9. Image Mask Binary Protection
 
 `generateImage` accepts a prompt of shape `{ text, mask? }`. Originally the wrapper had `input.prompt = options.prompt.text ?? options.prompt` — fallback would serialize the entire object including the binary mask. Removed the fallback; if `prompt.text` isn't a string, we capture only `hasMask: true` and omit the body.
 
-### D10. Embed value truncation
+### D10. Embed Value Truncation
 
 `embed` and `embedMany` inputs were previously serialized untruncated. Added `truncateEmbedValue` and `truncateEmbedValues` helpers (mirror `truncateMessages`'s 50KB threshold). Bounded in practice by the model's input limit anyway, but defensive against future model versions or unusual inputs.
 
-### D11. Provider options truncation warning
+### D11. Provider Options Truncation Warning
 
 Provider options are JSON-stringified, truncated at 8KB. Now logs `logger.warn` when truncation happens so debugging stale `providerOptions` isn't silent.
 
+### D12. Parent Spans as SPAN, Not GENERATION
+
+> [!danger] The problem
+> Initially, every wrapper span carried `gen_ai.*` attributes (system, model, usage, finish_reasons). The trace UI showed each of them as **GENERATION** — including the agent top-level span. Two consequences:
+> 1. **Cost double-counting** — both the parent `generateText` and its `doGenerate` child reported `gen_ai.usage.input_tokens` / `output_tokens`. The cost engine multiplied each by model price, so a single LLM call cost was reported as 2×.
+> 2. **Confusing trace UI** — `vercel-ai.agent.generate` appeared as a GENERATION even though it wraps an entire multi-step agent loop, making it indistinguishable from the individual LLM calls inside it.
+
+**Root cause:** the backend classifies any span carrying `gen_ai.*` attributes as GENERATION, **regardless of `SpanKind`**. Changing `SpanKind` alone from `CLIENT` to `INTERNAL` was not enough.
+
+**Fix:** strip all `gen_ai.*` attributes from parent wrapper spans (`generateText`, `streamText`, `generateObject`, `streamObject`, `agent.generate`, `agent.stream`). Keep them **only** on `doGenerate` / `doStream` children. Parent spans carry `vercel_ai.*` (tool_choice, provider_options, steps_count, TTFT, gateway cost) and `AIOPS_INTERNAL.*` (input/output JSON).
+
+**Exception:** `embed`, `embedMany`, `generateImage`, `rerank` keep `gen_ai.*` on the parent because they have no `doGenerate` child to carry it — stripping would lose LLM metadata entirely.
+
+**Result:** the trace UI now shows agent runs as a SPAN hierarchy with GENERATION leaves, and cost is attributed exactly once per LLM call at the `doGenerate` / `doStream` child.
+
+### D13. Tool Span Operation Name: `execute_tool`
+
+Tool child spans set `gen_ai.operation.name: 'execute_tool'` rather than a bespoke `'tool'` value. This aligns with the OpenTelemetry GenAI semantic conventions for tool execution spans and keeps the span out of the GENERATION bucket (tool spans don't have `gen_ai.system` / `gen_ai.usage.*` — the only `gen_ai.*` attribute on them is `operation.name`, which is not a generation-typing signal).
+
+### D14. `experimental_telemetry` Suppression
+
+> [!warning] The problem
+> The [[Vercel AI SDK]] ships its own built-in OTel telemetry, enabled by passing `experimental_telemetry: { isEnabled: true }` to any call. If a user (a) enables this AND (b) uses `Observe.wrapVercelAI(ai)`, **both paths emit spans for the same call** — duplicate trace tree, duplicate cost, confusing parent-child relationships.
+
+**Fix:** the wrapper forcibly injects `experimental_telemetry: { isEnabled: false }` into the options of every wrapped call (`generateText`, `streamText`, `generateObject`, `streamObject`, and the inner `doGenerate` / `doStream` calls inside agents). This disables the SDK's internal telemetry path so the only span source is ours.
+
+**Trade-off:** a user who deliberately sets `experimental_telemetry: { isEnabled: true }` will have it silently flipped off. Documented behavior — users who want the SDK's telemetry path should not wrap with `Observe.wrapVercelAI`, or use `experimental_telemetry.recordInputs` / `recordOutputs` flags on the wrapper side instead.
+
 ---
 
-## 5. v4 compatibility
+## 5. v4 Compatibility
 
-v4 has a different API surface. We support it via fallback field reads.
+> [!info]
+> v4 has a different API surface. We support it via fallback field reads — no separate code path.
 
 | Area | v4 | v5+ | Wrapper handles via |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Max tokens param | `maxTokens` | `maxOutputTokens` | `options.maxOutputTokens ?? options.maxTokens` |
 | Input token usage | `usage.promptTokens` | `usage.inputTokens` | `usage.inputTokens ?? usage.promptTokens` |
 | Output token usage | `usage.completionTokens` | `usage.outputTokens` | `usage.outputTokens ?? usage.completionTokens` |
@@ -279,29 +369,31 @@ v4 has a different API surface. We support it via fallback field reads.
 
 ---
 
-## 6. Known issues & limitations
+## 6. Known Issues & Limitations
 
-### Issue #9 — AI SDK v6 tool property name mismatch (UPSTREAM)
+### Issue #9 — AI SDK v6 Tool Property Name Mismatch (UPSTREAM)
 
-**Status:** [vercel/ai#12020](https://github.com/vercel/ai/issues/12020) — OPEN
-**Affected:** `ai@6.x` + any `@ai-sdk/*` provider.
-**Affects all schema types** (`jsonSchema()`, `z.object()` Zod v3 and v4) — NOT a Zod-specific issue.
+> [!bug] Status: [vercel/ai#12020](https://github.com/vercel/ai/issues/12020) — OPEN
+> **Affected:** `ai@6.x` + any `@ai-sdk/*` provider.
+> **Affects all schema types** (`jsonSchema()`, `z.object()` Zod v3 and v4) — NOT a Zod-specific issue.
 
 **Errors:**
-- Anthropic: `tools.0.custom.input_schema.type: Field required`
-- OpenAI: `Invalid schema for function: schema must be a JSON Schema of 'type: "object"', got 'type: "None"'`
 
-**Root cause:** The `tool()` helper is an identity function. AI SDK docs and examples define tools with `parameters`:
-```js
-tool({ parameters: z.object({ city: z.string() }), execute: ... })
-```
-But `prepareToolsAndToolChoice()` reads `tool.inputSchema`. Since the tool object has `parameters` but NOT `inputSchema`, `tool.inputSchema` is `undefined` and `asSchema(undefined)` returns `{"properties":{},"additionalProperties":false}` — missing `type`, properties contents, and `required`. Provider rejects.
+- [[Anthropic]]: `tools.0.custom.input_schema.type: Field required`
+- [[OpenAI]]: `Invalid schema for function: schema must be a JSON Schema of 'type: "object"', got 'type: "None"'`
+
+**Root cause:** The `tool()` helper is an identity function. AI SDK docs and examples define tools with `parameters`, but `prepareToolsAndToolChoice()` reads `tool.inputSchema`. Since the tool object has `parameters` but NOT `inputSchema`, `tool.inputSchema` is `undefined` and `asSchema(undefined)` returns `{"properties":{},"additionalProperties":false}` — missing `type`, properties contents, and `required`. Provider rejects.
 
 **Workaround:** Use `inputSchema` instead of `parameters`:
+
 ```js
 tool({
   description: 'Get weather',
-  inputSchema: jsonSchema({ type: 'object', properties: { city: { type: 'string' } }, required: ['city'] }),
+  inputSchema: jsonSchema({
+    type: 'object',
+    properties: { city: { type: 'string' } },
+    required: ['city']
+  }),
   execute: async ({ city }) => ({ city, temp: 22 }),
 })
 ```
@@ -309,66 +401,65 @@ tool({
 **Affected methods:** `generateText` / `streamText` / `generateObject` (with tools), `agent.generate` / `agent.stream`.
 **Not affected:** all calls without `tools`, plus `embed` / `embedMany` / `generateImage` / `rerank`.
 
-**Impact on us:** None — we pass tools through unchanged. The mismatch is in the AI SDK core.
+> [!note]
+> **Impact on us:** None — we pass tools through unchanged. The mismatch is in the AI SDK core.
 
-### Limitation: Vercel AI SDK's built-in `experimental_telemetry` can duplicate spans
-
-The Vercel AI SDK has built-in OTel telemetry via `experimental_telemetry: { isEnabled: true }` on `generateText`/`streamText`/etc. If a user enables this AND uses `Observe.wrapVercelAI(ai)`, both paths emit spans for the same call → duplicates. No dedup logic exists currently.
-
-**Mitigation:** Document the conflict in usage docs. Users should use one or the other, not both. A future enhancement could detect `experimental_telemetry.isEnabled` in the options and log a warning or skip wrapping for that call.
-
-### Limitation: `generateText` doesn't loop in v6
+### Limitation: `generateText` Doesn't Loop in v6
 
 Plain `generateText({ tools, maxSteps: 10 })` makes one LLM call, executes whatever tools it asked for, then stops. It does NOT loop back to synthesize a final answer in v6. Use `ToolLoopAgent` for that.
 
-### Limitation: Cost shows $0 for embeddings (Google) and image generation
+### Limitation: Cost Shows $0 for Embeddings (Google) and Image Generation
 
 - **Google embedding** returns `usage.tokens: null`. Our wrapper correctly omits the field. The cost engine has no token count to multiply by price → $0.
 - **DALL-E** returns `usage.imagesGenerated` only. Cost is per-image, not per-token. Backend cost engine is token-based → $0.
 
-Both are observability-pipeline gaps in the backend, not bugs in our SDK. The data needed to compute cost (image count, size, model) IS captured on the span.
+> [!note]
+> Both are observability-pipeline gaps in the backend, not bugs in our SDK. The data needed to compute cost (image count, size, model) IS captured on the span.
 
-### Limitation: Sub-agent spans display as `Object.execute` in the UI
+### Limitation: Sub-Agent Spans Display as `Object.execute` in the UI
 
 Span name internally is `vercel-ai.agent.generate`. The trace UI displays it by `code.function` attribute (which is `Object.execute` because the calling tool's `execute: async () => {...}` is on an object literal). UI rendering preference, not a span data issue.
 
-### Limitation: First child of a generation-type span appears one indent deeper in the UI
+### Limitation: First Child Indentation Quirk in Trace Viewer
 
 Verified end-to-end via REST API: all sibling spans correctly share the same `parentObservationId`. The visual indentation difference is a renderer quirk in the trace viewer, not a real parent-child relationship issue.
 
-### Limitation: Tool arguments not scanned for secrets
+### Limitation: Tool Arguments Not Scanned for Secrets
 
 Tool `execute` arguments are captured verbatim via `JSON.stringify(toolArgs)`. If a user passes API keys, tokens, or auth headers as tool arguments, they will appear in the span. A lightweight redaction pass (scanning for `api_key`, `token`, `secret`, `password`, `bearer` patterns) would improve safety. Tracked for a future enhancement.
 
-### Limitation: `doStream` TransformStream span can leak on abandoned streams
+### Limitation: `doStream` TransformStream Span Can Leak on Abandoned Streams
 
 The `doStream` wrapper relies on `flush()` as a safety net to end the span. If the consumer abandons the stream without consuming or erroring, `flush()` may never fire. The higher-level `onError`/`onAbort` callbacks mitigate at the top-level span, but the inner `doStream` span has no timeout protection. A configurable timeout (e.g., 5 minutes) would resolve this.
 
-### Resolved issues found during testing
+### Resolved Issues Found During Testing
 
 Historical record of issues caught and resolved during development. Issue #9 (above) is the only one still active (upstream).
 
 | # | Issue | Status |
-|---|---|---|
+| --- | --- | --- |
 | 1 | `json: undefined` in messages | Frontend display issue (not us) |
 | 2 | `cached_input_tokens` always 0 | Correct provider value when no caching |
 | 3 | `stopSequences` stopped early | Test working correctly |
-| 4 | Tool schema raw Zod internals | **Fixed** — `safeSerializeSchema()` |
-| 5 | Missing schema in generateObject input | **Fixed** — captures `options.schema` |
-| 6 | Embed `tokens: null` | **Fixed** — `!= null` check |
-| 7 | generateImage missing cost | **Improved** — captures full `providerMetadata` |
-| 8 | OpenAI `no_cache_tokens` extra fields | Correct provider value |
-| 9 | Tool calls fail | **Upstream bug** (above) |
+| 4 | Tool schema raw Zod internals | ✅ **Fixed** — `safeSerializeSchema()` |
+| 5 | Missing schema in generateObject input | ✅ **Fixed** — captures `options.schema` |
+| 6 | Embed `tokens: null` | ✅ **Fixed** — `!= null` check |
+| 7 | generateImage missing cost | 🔧 **Improved** — captures full `providerMetadata` |
+| 8 | [[OpenAI]] `no_cache_tokens` extra fields | Correct provider value |
+| 9 | Tool calls fail | ⬆️ **Upstream bug** (above) |
+| 10 | Parent spans showed as GENERATION (cost double-counted) | ✅ **Fixed** — see [[#D12. Parent Spans as SPAN, Not GENERATION]] |
+| 11 | Tool spans mis-typed | ✅ **Fixed** — `execute_tool` per OTel GenAI semconv ([[#D13. Tool Span Operation Name: `execute_tool`]]) |
+| 12 | Duplicate spans from `experimental_telemetry` | ✅ **Fixed** — automatic suppression ([[#D14. `experimental_telemetry` Suppression]]) |
 
 ---
 
-## 7. What we do NOT trace
+## 7. What We Do NOT Trace
 
 | Excluded | Why |
-|---|---|
+| --- | --- |
 | `experimental_generateSpeech` | Still experimental. Add when stable. |
 | `experimental_transcribe` | Still experimental. Add when stable. |
-| Provider HTTP calls | Already traced by separate OpenAI / Anthropic / Bedrock instrumentations. Tracing both layers would create duplicate spans. |
+| Provider HTTP calls | Already traced by separate [[OpenAI]] / [[Anthropic]] / [[Bedrock]] instrumentations. Tracing both layers would create duplicate spans. |
 | Per-step LLM spans (via `onStepFinish`) | Already covered by per-`doGenerate` spans. Adding step-level spans would duplicate. |
 | `headers` / `abortSignal` | Request infrastructure, not observability-relevant. |
 | Embedding / image / rerank `doGenerate` spans | Single-call operations — top-level span already captures everything. |
@@ -376,46 +467,47 @@ Historical record of issues caught and resolved during development. Issue #9 (ab
 
 ---
 
-## 8. Competitive position
+## 8. Competitive Position
 
-| Capability | Us | Braintrust | Langfuse | Arize |
-|---|---|---|---|---|
-| Setup | `Observe.wrapVercelAI(ai)` | `wrapAISDK(ai)` | `experimental_telemetry` per call | Same as Langfuse |
-| ESM + CJS | Yes | Yes | Yes | Yes |
-| `embed` / `embedMany` | Yes | Yes | No | No |
-| `generateImage` | Yes | **No** (verified 2026-04-08, `ai-sdk.ts`) | No | No |
-| `rerank` | Yes | **No** (verified 2026-04-08) | No | No |
-| Agent tracing | Yes | Yes | No | No |
-| Per-tool child spans | Yes | Yes | No | No |
-| Per-LLM-call (`doGenerate`) spans | Yes | Yes | No | No |
-| `totalUsage` (multi-step) | Yes | Yes | No | No |
-| `steps_count` | Yes | Yes | No | No |
-| TTFT (time to first token) | Yes | Yes | No | No |
-| OTel-native spans | **Yes** | No (proprietary) | Yes | Yes |
+| Capability | Us | [[Braintrust]] | [[Langfuse]] | [[Arize]] |
+| --- | --- | --- | --- | --- |
+| Setup | `Observe.wrapVercelAI(ai)` | `wrapAISDK(ai)` | `experimental_telemetry` per call | Same as [[Langfuse]] |
+| ESM + CJS | ✅ | ✅ | ✅ | ✅ |
+| `embed` / `embedMany` | ✅ | ✅ | ❌ | ❌ |
+| `generateImage` | ✅ | ❌ (verified 2026-04-08, `ai-sdk.ts`) | ❌ | ❌ |
+| `rerank` | ✅ | ❌ (verified 2026-04-08) | ❌ | ❌ |
+| Agent tracing | ✅ | ✅ | ❌ | ❌ |
+| Per-tool child spans | ✅ | ✅ | ❌ | ❌ |
+| Per-LLM-call (`doGenerate`) spans | ✅ | ✅ | ❌ | ❌ |
+| `totalUsage` (multi-step) | ✅ | ✅ | ❌ | ❌ |
+| `steps_count` | ✅ | ✅ | ❌ | ❌ |
+| TTFT (time to first token) | ✅ | ✅ | ❌ | ❌ |
+| OTel-native spans | ✅ | ❌ (proprietary) | ✅ | ✅ |
 
-**Verified claims:** All "No" entries for competitors were verified against source or docs on 2026-04-08. Braintrust `embed`/`embedMany` support was initially claimed as absent — this was **wrong** (they have `wrapEmbed`/`wrapEmbedMany`). Corrected above. See `references/sdk-instrumentation-lessons.md` §11a for the full competitor-claim lesson.
+> [!warning] Verified claims
+> All "No" entries for competitors were verified against source or docs on 2026-04-08. [[Braintrust]] `embed`/`embedMany` support was initially claimed as absent — this was **wrong** (they have `wrapEmbed`/`wrapEmbedMany`). Corrected above. See `references/sdk-instrumentation-lessons.md` §11a for the full competitor-claim lesson.
 
 ---
 
 ## 9. Files
 
 | File | Role |
-|---|---|
-| `src/instrumentations/vercel-ai/wrap-vercel-ai.ts` | The wrapper (single file, ~1500 LOC) |
+| --- | --- |
+| `src/instrumentations/vercel-ai/wrap-vercel-ai.ts` | The wrapper (single file, ~1600 LOC) |
 | `src/client.ts` | `Observe.wrapVercelAI` public API |
 | `src/index.ts` | Re-export `wrapVercelAI` |
 | `tests/featureTest/auto-tracing/wrap-vercel-ai.test.ts` | 60+ unit tests |
-| `tests/llm-providers/auto-tracing-vercel-ai-agent.cjs` | Live integration test (runs against real OpenAI + local backend) |
+| `tests/llm-providers/auto-tracing-vercel-ai-agent.cjs` | Live integration test (runs against real [[OpenAI]] + local backend) |
 | `docs/plans/vercel-ai-final.md` | This document |
 
 ---
 
-## 10. Demo routes (in `demo-application/nodejs`)
+## 10. Demo Routes (in `demo-application/nodejs`)
 
-The demo app exposes 19 routes for the `vercel_ai` provider. Recommended demo subset (covers every unique span shape):
+The demo app exposes 20 routes for the `vercel_ai` provider. Recommended demo subset (covers every unique span shape):
 
 | Route | What it shows |
-|---|---|
+| --- | --- |
 | `POST /generate` | Plain `generateText` → `doGenerate` |
 | `POST /stream` | `streamText` → `doStream` |
 | `POST /chat-generate` | Same as `/generate` but messages-based |
@@ -431,10 +523,11 @@ The demo app exposes 19 routes for the `vercel_ai` provider. Recommended demo su
 | `POST /multi-agent` | Coordinator + 2 sub-agents (nested via tool bodies) |
 | `POST /nested-agents` | Main agent → tool → sub-agent → tool (deepest nesting) |
 | `POST /image-generation` | `generateImage` (DALL-E 3) |
+| `POST /telemetry-override` | Verifies `experimental_telemetry: { isEnabled: true }` is suppressed — see [[#D14. `experimental_telemetry` Suppression]] |
 
 ---
 
-## 11. Recent fixes timeline (PR #961)
+## 11. Recent Fixes Timeline (PR #961)
 
 In rough order of when they shipped during the PR:
 
@@ -442,25 +535,29 @@ In rough order of when they shipped during the PR:
 2. **`createAgentStreamWrapper` Promise handling** — `ToolLoopAgent.stream()` returns `PromiseLike` in v6; wrapper now awaits.
 3. **Per-tool child spans on agents** — added `wrapToolExecutions`-equivalent at the agent construct trap.
 4. **AGENT_TOOL_WRAPPED idempotency marker** — interim fix for nested duplicate tool spans.
-5. **Root mutation fix** — replaced the marker fix with proper non-mutating clone of `instance.settings.tools`. User tool objects are no longer modified.
-6. **`wrapLanguageModel` (`doGenerate` / `doStream`)** — per-LLM-call child spans, matches Braintrust shape.
-7. **`finishReason` normalization** — central `extractFinishReason()` handles v6's `{unified, raw}` object shape.
-8. **Token coercion** — `asNumber` everywhere; eliminates `[object Object][object Object]` from token attrs.
-9. **`onError` / `onAbort` for streams** — span no longer leaks when stream errors or is aborted before `onFinish`.
-10. **Image mask binary leak** — fallback removed; only `hasMask: true` is captured if `prompt.text` is missing.
-11. **Embed value truncation** — bounded by `MAX_INPUT_MESSAGES_BYTES` (50 KB).
-12. **Provider options truncation warning** — `logger.warn` emitted when serialized options exceed 8KB.
+5. **Root mutation fix** — replaced the marker fix with proper non-mutating clone of `instance.settings.tools`. User tool objects are no longer modified. (See [[#D3. Don't Mutate User Tool Objects (root fix)]])
+6. **`wrapLanguageModel` (`doGenerate` / `doStream`)** — per-LLM-call child spans, matches [[Braintrust]] shape. (See [[#D2. Per-LLM-Call `doGenerate` / `doStream` Spans (added later)]])
+7. **`finishReason` normalization** — central `extractFinishReason()` handles v6's `{unified, raw}` object shape. (See [[#D7. `finishReason` Normalization]])
+8. **Token coercion** — `asNumber` everywhere; eliminates `[object Object][object Object]` from token attrs. (See [[#D8. Number Coercion on Token Attributes]])
+9. **`onError` / `onAbort` for streams** — span no longer leaks when stream errors or is aborted before `onFinish`. (See [[#D6. Stream Wrapper Handles `onError` / `onAbort`]])
+10. **Image mask binary leak** — fallback removed; only `hasMask: true` is captured if `prompt.text` is missing. (See [[#D9. Image Mask Binary Protection]])
+11. **Embed value truncation** — bounded by `MAX_INPUT_MESSAGES_BYTES` (50 KB). (See [[#D10. Embed Value Truncation]])
+12. **Provider options truncation warning** — `logger.warn` emitted when serialized options exceed 8KB. (See [[#D11. Provider Options Truncation Warning]])
+13. **Parent spans reclassified to SPAN** — removed all `gen_ai.*` attrs from wrapper spans (`generateText`, `streamText`, `generateObject`, `streamObject`, `agent.generate`, `agent.stream`). Only `doGenerate` / `doStream` children retain `gen_ai.*` and therefore cost. Fixes double-counted cost and the confusing "agent = GENERATION" display. (See [[#D12. Parent Spans as SPAN, Not GENERATION]])
+14. **Tool spans use `gen_ai.operation.name: 'execute_tool'`** — aligns with OTel GenAI semconv, keeps tool spans out of the GENERATION bucket. (See [[#D13. Tool Span Operation Name: `execute_tool`]])
+15. **`experimental_telemetry` suppression** — wrapper injects `experimental_telemetry: { isEnabled: false }` into every wrapped call, preventing duplicate spans from the SDK's built-in telemetry path. (See [[#D14. `experimental_telemetry` Suppression]])
 
-All changes live in `src/instrumentations/vercel-ai/wrap-vercel-ai.ts`. Net diff for PR: ~1500 LOC added (wrapper) + the supporting test files.
+All changes live in `src/instrumentations/vercel-ai/wrap-vercel-ai.ts`. Net diff for PR: ~1600 LOC added (wrapper) + the supporting test files.
 
 ---
 
-## 12. Lessons contributed to SDK review skill
+## 12. Lessons Contributed to SDK Review Skill
 
-This instrumentation's post-mortem produced lessons that are now encoded in the team's `/sdk-review-instrumentation` skill rubric. Key contributions:
+> [!abstract]
+> This instrumentation's post-mortem produced lessons that are now encoded in the team's `/sdk-review-instrumentation` skill rubric. Key contributions:
 
 | Lesson | Rubric rule | Category |
-|---|---|---|
+| --- | --- | --- |
 | ESM standalone function exports cannot be patched | MS-1 (Architectural Blocker) | module-system |
 | Competitor claims without source links are wrong by default | CC-1, CC-3 (Blocker) | competitor-claims |
 | Version matrix with wrong npm→SDK mapping | VM-1 (Warning) | version-matrix |
@@ -471,6 +568,7 @@ This instrumentation's post-mortem produced lessons that are now encoded in the 
 | `finishReason` may be object, not string | RS-6 (Warning) | runtime-shape |
 | `experimental_telemetry` dedup with our wrapping | AF-7 (Warning) | agent-framework |
 | Tool object mutation causes nested duplicates | AF-5 (Blocker) | agent-framework |
+| Backend types spans by `gen_ai.*` presence, not SpanKind | ST-1 (Blocker) | span-typing |
 
 See `.claude/skills/sdk:review-instrumentation/references/sdk-instrumentation-lessons.md` for the full catalogue.
 
@@ -479,11 +577,22 @@ See `.claude/skills/sdk:review-instrumentation/references/sdk-instrumentation-le
 ## 13. References
 
 - Upstream bug: [vercel/ai#12020](https://github.com/vercel/ai/issues/12020)
-- Vercel AI SDK docs: https://ai-sdk.dev
+- [[Vercel AI SDK]] docs: https://ai-sdk.dev
 - v5 migration guide: https://ai-sdk.dev/docs/migration-guides/migration-guide-5-0
 - v6 migration guide: https://ai-sdk.dev/docs/migration-guides/migration-guide-6-0
-- OTel GenAI semantic conventions: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
-- Braintrust `wrapAISDK` source (reference for `doGenerate` span shape): `github.com/braintrustdata/braintrust-sdk/js/src/wrappers/ai-sdk/ai-sdk.ts`
+- [[OpenTelemetry]] GenAI semantic conventions: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
+- [[Braintrust]] `wrapAISDK` source (reference for `doGenerate` span shape): `github.com/braintrustdata/braintrust-sdk/js/src/wrappers/ai-sdk/ai-sdk.ts`
 - SDK instrumentation review skill: `.claude/skills/sdk:review-instrumentation/`
 - Lessons catalogue: `.claude/skills/sdk:review-instrumentation/references/sdk-instrumentation-lessons.md`
 - Demo app: `demo-application/nodejs/providers/vercel_ai.js`
+
+---
+
+## Related Notes
+
+- [[Pinecone Auto-Tracing Instrumentation — Specification]]
+- [[Auto-Tracing Architecture]]
+- [[OpenTelemetry Instrumentation Patterns]]
+- [[RAG Pipeline Observability]]
+- [[Vercel AI SDK v7 — registerTelemetryIntegration Plan]]
+- [[SDK Instrumentation Lessons]]
